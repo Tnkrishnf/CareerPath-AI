@@ -1,8 +1,10 @@
 import hashlib
 import secrets
 from datetime import timedelta
+from urllib.parse import urlencode
 
-from flask import Blueprint, current_app, request
+import requests
+from flask import Blueprint, current_app, redirect, request, session
 from flask_jwt_extended import create_access_token, get_jwt, jwt_required
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -19,6 +21,113 @@ def _token_for(user: User) -> str:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _frontend_redirect(path: str, **params) -> str:
+    query = urlencode(params)
+    return f"{current_app.config['FRONTEND_URL']}{path}" + (f"?{query}" if query else "")
+
+
+@bp.get("/github/login")
+@limiter.limit("20 per minute")
+def github_login():
+    client_id = current_app.config["GITHUB_CLIENT_ID"]
+    if not client_id:
+        err("GitHub sign-in is not configured.", 503)
+    state = secrets.token_urlsafe(32)
+    session["github_oauth_state"] = state
+    params = urlencode({
+        "client_id": client_id,
+        "redirect_uri": current_app.config["GITHUB_REDIRECT_URI"],
+        "scope": "read:user user:email",
+        "state": state,
+    })
+    return redirect(f"https://github.com/login/oauth/authorize?{params}")
+
+
+@bp.get("/github/callback")
+@limiter.limit("20 per minute")
+def github_callback():
+    error = request.args.get("error")
+    if error:
+        return redirect(_frontend_redirect("/login", error="GitHub authorization was cancelled or denied"))
+
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code or not state or state != session.pop("github_oauth_state", None):
+        return redirect(_frontend_redirect("/login", error="Invalid or expired GitHub sign-in request"))
+
+    client_id = current_app.config["GITHUB_CLIENT_ID"]
+    client_secret = current_app.config["GITHUB_CLIENT_SECRET"]
+    if not client_id or not client_secret:
+        return redirect(_frontend_redirect("/login", error="GitHub sign-in is not configured"))
+
+    try:
+        token_response = requests.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+                "redirect_uri": current_app.config["GITHUB_REDIRECT_URI"],
+            },
+            timeout=10,
+        )
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        if not access_token:
+            raise ValueError("GitHub did not issue an access token")
+
+        headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"}
+        profile_response = requests.get("https://api.github.com/user", headers=headers, timeout=10)
+        profile_response.raise_for_status()
+        github_profile = profile_response.json()
+
+        email = github_profile.get("email")
+        if not email:
+            emails_response = requests.get("https://api.github.com/user/emails", headers=headers, timeout=10)
+            emails_response.raise_for_status()
+            email_entries = emails_response.json()
+            email = next(
+                (entry["email"] for entry in email_entries
+                 if entry.get("primary") and entry.get("verified") and entry.get("email")),
+                None,
+            )
+        if not email:
+            return redirect(_frontend_redirect("/login", error="GitHub did not provide a verified email address"))
+
+        email = email.strip().lower()
+        if not EMAIL_RE.match(email):
+            return redirect(_frontend_redirect("/login", error="GitHub returned an invalid email address"))
+
+        user = User.query.filter_by(email=email).first()
+        if user:
+            if not user.is_active:
+                return redirect(_frontend_redirect("/login", error="This account has been disabled"))
+        else:
+            full_name = clean_str(github_profile.get("name") or github_profile.get("login"), "Full name", required=True, max_len=120)
+            user = User(
+                email=email,
+                full_name=full_name,
+                role="student",
+                password_hash=generate_password_hash(secrets.token_urlsafe(32)),
+            )
+            user.profile = StudentProfile()
+            db.session.add(user)
+
+        user.last_login = utcnow()
+        db.session.commit()
+        return redirect(_frontend_redirect(
+            "/github/callback",
+            token=_token_for(user),
+            role=user.role,
+        ))
+    except requests.RequestException:
+        current_app.logger.warning("GitHub OAuth request failed", exc_info=True)
+        return redirect(_frontend_redirect("/login", error="Could not sign in with GitHub"))
+    except ValueError:
+        return redirect(_frontend_redirect("/login", error="Could not complete GitHub sign-in"))
 
 
 @bp.post("/register")

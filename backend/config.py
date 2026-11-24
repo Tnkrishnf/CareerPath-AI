@@ -19,6 +19,11 @@ class Config:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
 
+    GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
+    GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
+    GITHUB_REDIRECT_URI = os.getenv("GITHUB_REDIRECT_URI", "http://localhost:5000/api/auth/github/callback")
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
     MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5 MB upload cap (resume PDFs)
     MAX_PDF_PAGES = 10
 
